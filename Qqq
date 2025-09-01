@@ -1,1 +1,195 @@
-2. Start the server:
+import os
+import hashlib
+from datetime import datetime
+from abc import ABC, abstractmethod
+from typing import List
+from concurrent.futures import ThreadPoolExecutor
+import git
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+from flask import Flask, jsonify
+
+# ----------------------------
+# Logging
+# ----------------------------
+def setup_logging(log_path: str) -> logging.Logger:
+    """Configures and returns a logger for the system."""
+    logger = logging.getLogger("KnAiSystem")
+    logger.setLevel(logging.INFO)
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    handler = RotatingFileHandler(log_path, maxBytes=5 * 1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter("[{asctime}] {levelname}: {message}", style="{"))
+    logger.addHandler(handler)
+    return logger
+
+# ----------------------------
+# AI Interface
+# ----------------------------
+class AIInterface(ABC):
+    """Abstract base class for AI models."""
+    @abstractmethod
+    def generate_update(self) -> str:
+        """Generates a JSON string representing an AI update."""
+        pass
+
+# Example AI Implementations
+class KnowledgeGraphAI(AIInterface):
+    """Generates a sample knowledge graph update."""
+    def generate_update(self) -> str:
+        return f'{{"nodes": [{{"id": "n1", "label": "Concept A"}}, {{"id": "n2", "label": "Concept B"}}], "edges": [{{"from": "n1", "to": "n2", "relation": "related_to"}}]}}'
+
+class DataMarketplaceAI(AIInterface):
+    """Generates a sample data marketplace update."""
+    def generate_update(self) -> str:
+        return f'{{"dataset_id": "ds{int(datetime.now().timestamp())}", "description": "New dataset", "price": "10 KNAI"}}'
+
+# ----------------------------
+# KNAI System
+# ----------------------------
+class KnAiSystem:
+    """Manages the AI update cycle, including file saving and Git operations."""
+    def __init__(self, ais: List[AIInterface], repo_path: str, log_path: str):
+        self.ais = ais
+        self.repo_path = Path(repo_path)
+        self.data_path = self.repo_path / 'data'  # All data files will be in a 'data' subdir of the repo
+        self.logger = setup_logging(log_path)
+        self.latest_update = None
+        self.last_hash = None
+        self._setup_git_repo()
+
+    def _setup_git_repo(self) -> None:
+        """Initializes a Git repository if it doesn't exist and ensures it's clean."""
+        try:
+            repo = git.Repo(self.repo_path)
+            self.logger.info(f"Using existing Git repository at {self.repo_path}")
+        except git.exc.InvalidGitRepositoryError:
+            self.logger.info(f"Initializing new Git repository at {self.repo_path}")
+            repo = git.Repo.init(self.repo_path)
+            # Add a .gitignore to ignore logs and temp files
+            self.repo_path.joinpath(".gitignore").write_text("*.log\n*.pyc\n__pycache__/\n")
+            repo.index.add([str(self.repo_path / '.gitignore')])
+            repo.index.commit("Initial commit with .gitignore")
+            self.logger.info("Initialized Git repo and committed .gitignore.")
+
+        # Ensure the 'data' directory exists inside the repo
+        self.data_path.mkdir(parents=True, exist_ok=True)
+        self.logger.info(f"Data path is set to: {self.data_path}")
+
+    def _hash_content(self, content: str) -> str:
+        return hashlib.sha256(content.encode()).hexdigest()
+
+    def merge_ai_outputs(self, outputs: List[str]) -> str:
+        if not outputs:
+            raise ValueError("No AI outputs to merge")
+        return f'{{"updates": [{",".join(outputs)}]}}'
+
+    def save_update_file(self, content: str) -> str:
+        """Saves the merged content to a new HTML file and updates the symlink."""
+        content_hash = self._hash_content(content)
+        if self.last_hash == content_hash:
+            self.logger.info("No changes detected, skipping save and commit.")
+            return None
+        self.last_hash = content_hash
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"knai_update_{timestamp}.html"
+        filepath = self.data_path / filename
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head><title>KNAI Update</title></head>
+        <body><pre>{content}</pre></body>
+        </html>
+        """
+        with open(filepath, "w") as f:
+            f.write(html_content)
+
+        # Update symlink
+        latest_link = self.data_path / "knai_update_latest.html"
+        if latest_link.exists() or latest_link.is_symlink():
+            latest_link.unlink()
+        latest_link.symlink_to(filepath.name)
+
+        self.latest_update = content
+        self.logger.info(f"Saved update: {filename}")
+        return filename
+
+    def commit_to_github(self, filename: str) -> None:
+        """Adds, commits, and pushes the new update file to GitHub."""
+        if not filename:
+            self.logger.info("No new update to commit.")
+            return
+        try:
+            repo = git.Repo(self.repo_path)
+            # Add the newly created file and the symlink to the index
+            repo.index.add([str(self.data_path / filename), str(self.data_path / 'knai_update_latest.html')])
+            
+            # Check if there are any changes to commit
+            if not repo.index.diff("HEAD"):
+                self.logger.info("No new changes to commit to GitHub.")
+                return
+
+            repo.index.commit(f"KNAI auto-update: {filename}")
+            
+            # Use 'main' or 'master' based on your repo's default branch
+            active_branch = repo.active_branch.name 
+            self.logger.info(f"Pushing to remote origin/{active_branch}")
+            repo.git.push('origin', active_branch)
+            self.logger.info(f"Pushed to GitHub: {filename}")
+        except Exception as e:
+            self.logger.error(f"Git push failed: {e}")
+            raise
+
+    def run_update_cycle(self) -> None:
+        self.logger.info("Starting KNAI update cycle")
+        try:
+            # Generate AI outputs concurrently
+            with ThreadPoolExecutor(max_workers=len(self.ais)) as executor:
+                outputs = [future.result(timeout=30) for future in 
+                          [executor.submit(ai.generate_update) for ai in self.ais]]
+                for i, out in enumerate(outputs):
+                    self.logger.info(f"AI {i + 1} output: {out[:50]}...")
+
+            # Merge, save, commit
+            merged_content = self.merge_ai_outputs(outputs)
+            filename = self.save_update_file(merged_content)
+            self.commit_to_github(filename)
+
+        except Exception as e:
+            self.logger.error(f"Update cycle failed: {e}")
+            raise
+        self.logger.info("KNAI update cycle completed")
+
+# ----------------------------
+# Flask API
+# ----------------------------
+app = Flask(__name__)
+kn_ai = None
+
+@app.route("/api/updates", methods=["GET"])
+def get_updates():
+    if kn_ai.latest_update:
+        return jsonify({"update": kn_ai.latest_update})
+    return jsonify({"error": "No updates available"}), 404
+
+@app.route("/run-update", methods=["POST"])
+def run_update():
+    try:
+        kn_ai.run_update_cycle()
+        return jsonify({"status": "Update cycle completed"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ----------------------------
+# Initialize
+# ----------------------------
+if __name__ == "__main__":
+    ais = [KnowledgeGraphAI(), DataMarketplaceAI()]
+    kn_ai = KnAiSystem(
+        ais=ais,
+        repo_path=os.getenv("KNAI_REPO_PATH", "/tmp/knai_repo"),
+        log_path=os.getenv("KNAI_LOG_PATH", "/tmp/knai_repo/logs/knai.log")
+    )
+    app.run(host="0.0.0.0", port=5000)
+
