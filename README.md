@@ -1,4 +1,4 @@
-# Flowgrove 🌱
+# Kn.Ai✨
 
 This is a simple Flask app deployed on Render.
 
